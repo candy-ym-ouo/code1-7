@@ -1,0 +1,16 @@
+{
+  "name": "recording-media-pipeline",
+  "version": "1.0.0",
+  "description": "录音入库与媒体任务投递：可恢复事务 + Transactional Outbox，Redis 短暂不可用不丢任务、重试不产生重复处理记录",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test test/index.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "ioredis": "^6.0.0"
+  }
+}
