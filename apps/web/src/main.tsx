@@ -291,11 +291,17 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
     setError('');
     const form = new FormData();
     form.append('file', file);
+    // 同一次上传的任何重试（超时、网络抖动后重发）复用幂等键，服务端不会建第二份录音
+    const idempotencyKey =
+      typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     try {
       await api<Recording>(`/v1/workspaces/${workspace.id}/recordings/uploads`, {
         method: 'POST',
         body: form,
+        headers: { 'Idempotency-Key': idempotencyKey },
       });
       await loadRecordings();
     } catch (uploadError) {

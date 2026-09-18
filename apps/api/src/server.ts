@@ -17,6 +17,12 @@ import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import { z } from 'zod';
 import {
+  MEDIA_JOB_OPTIONS,
+  dispatchPendingTasks,
+  startOutboxSweeper,
+  type OutboxSweeper,
+} from './outbox.js';
+import {
   chapterBlockCreateSchema,
   chapterCreateSchema,
   chapterUpdateSchema,
@@ -91,6 +97,21 @@ const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
 redis.on('error', (error) => app.log.warn({ err: error }, 'Redis connection error'));
 
 const mediaQueue = new Queue('media', { connection: redis });
+
+// 发件箱补偿器：Redis 短暂不可用导致即时投递失败的任务，会在恢复后自动补投；
+// 同时回收 worker 崩溃遗留的陈旧任务。API 与 worker 各跑一个，互不冲突。
+const outboxSweeper: OutboxSweeper = startOutboxSweeper(
+  prisma,
+  mediaQueue,
+  {
+    info: (obj: unknown, msg?: string) => app.log.info(obj, msg),
+    warn: (obj: unknown, msg?: string) => app.log.warn(obj, msg),
+    error: (obj: unknown, msg?: string) => app.log.error(obj, msg),
+    debug: (obj: unknown, msg?: string) => app.log.debug(obj, msg),
+  },
+  { intervalMs: 5000 },
+);
+outboxSweeper.start();
 
 await app.register(cors, {
   origin: webOrigins,
@@ -383,6 +404,17 @@ app.post(
     const workspaceId = (req.params as { id: string }).id;
     await requireMembership(req, workspaceId, [Role.OWNER, Role.EDITOR]);
 
+    // 客户端重试（网络抖动、超时重发）携带相同键时，返回第一份录音而不是再建一条
+    const idempotencyKey = parseIdempotencyKey(req.headers['idempotency-key']);
+    if (idempotencyKey) {
+      const existing = await prisma.recording.findUnique({
+        where: { uploadKey: `${workspaceId}:${idempotencyKey}` },
+      });
+      if (existing) {
+        return reply.send({ data: recordingDto(existing) });
+      }
+    }
+
     let upload;
     try {
       upload = await req.file();
@@ -426,44 +458,59 @@ app.post(
         throw new HttpError(400, 'EMPTY_FILE', '录音文件为空');
       }
 
-      const recording = await prisma.recording.create({
-        data: {
-          id,
-          workspaceId,
-          title: originalName,
-          originalPath: filePath,
-          mimeType: upload.mimetype,
-          sizeBytes: BigInt(fileStat.size),
-          durationMs: 0,
-          createdById: authUser(req).id,
-          status: 'PROCESSING',
-        },
-      });
+      // 录音与媒体任务在同一事务落库：只要事务提交成功，任务就绝不会丢。
+      // Redis 此刻是否可用不影响入库；投递失败由发件箱 sweeper 在 Redis 恢复后补偿。
+      let recording;
+      try {
+        recording = await prisma.$transaction(async (tx) => {
+          const created = await tx.recording.create({
+            data: {
+              id,
+              workspaceId,
+              title: originalName,
+              originalPath: filePath,
+              mimeType: upload.mimetype,
+              sizeBytes: BigInt(fileStat.size),
+              durationMs: 0,
+              createdById: authUser(req).id,
+              status: 'PROCESSING',
+              uploadKey: idempotencyKey ? `${workspaceId}:${idempotencyKey}` : null,
+            },
+          });
+          await tx.mediaTask.create({
+            data: { recordingId: created.id, status: 'PENDING' },
+          });
+          return created;
+        });
+      } catch (error) {
+        // 并发重放（两个请求带相同 Idempotency-Key 同时到达）：
+        // 唯一索引挡住第二份，删除刚写入的文件并返回已存在的录音
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002' &&
+          (error.meta?.target as string[] | undefined)?.includes('uploadKey')
+        ) {
+          await unlink(filePath).catch(() => undefined);
+          const winner = await prisma.recording.findUniqueOrThrow({
+            where: { uploadKey: `${workspaceId}:${idempotencyKey}` },
+          });
+          return reply.send({ data: recordingDto(winner) });
+        }
+        throw error;
+      }
 
       recordingPersisted = true;
 
+      // 尽力即时投递，让常见路径保持“上传后立刻开始处理”。
+      // 失败/超时只记日志：任务仍是 PENDING， sweeper 会补投，接口仍返回 201。
       try {
-        await mediaQueue.add(
-          'media.process',
-          { recordingId: recording.id },
-          {
-            jobId: recording.id,
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 1000 },
-            removeOnComplete: { age: 3600, count: 1000 },
-            removeOnFail: { age: 24 * 3600, count: 1000 },
-          },
-        );
-      } catch (error) {
-        await prisma.recording.update({
-          where: { id: recording.id },
-          data: {
-            status: 'FAILED',
-            processingError: '媒体队列不可用，请稍后重试',
-          },
+        await dispatchPendingTasks(prisma, mediaQueue, {
+          limit: 1,
+          timeoutMs: 2500,
+          jobOptions: MEDIA_JOB_OPTIONS,
         });
-        req.log.error({ err: error }, 'failed to enqueue media job');
-        throw new HttpError(503, 'MEDIA_QUEUE_UNAVAILABLE', '媒体队列不可用，请稍后重试');
+      } catch (error) {
+        req.log.warn({ err: error, recordingId: recording.id }, 'media outbox dispatch deferred');
       }
 
       return reply.code(201).send({ data: recordingDto(recording) });
@@ -475,6 +522,14 @@ app.post(
     }
   },
 );
+
+function parseIdempotencyKey(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const key = value.trim();
+  // 可打印 ASCII、长度 8~128，防止滥用超长键或注入控制字符
+  if (key.length < 8 || key.length > 128) return null;
+  return /^[\x21-\x7e]+$/.test(key) ? key : null;
+}
 
 app.get('/v1/workspaces/:id/recordings', { preHandler: authenticate }, async (req) => {
   const workspaceId = (req.params as { id: string }).id;
@@ -924,6 +979,7 @@ app.get('/v1/realtime', { websocket: true }, async (socket: any, req: any) => {
 });
 
 app.addHook('onClose', async () => {
+  await outboxSweeper.stop();
   await mediaQueue.close();
   if (redis.status !== 'end') redis.disconnect();
   await prisma.$disconnect();

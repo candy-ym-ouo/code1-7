@@ -21,6 +21,17 @@ enum RecordingStatus {
   FAILED
 }
 
+enum MediaTaskStatus {
+  // 已随录音入库，等待投递到 Redis 队列
+  PENDING
+  // 已投递，等待 worker 认领
+  QUEUED
+  // worker 已认领，正在处理（lockedAt 为处理心跳）
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
 enum ChapterStatus {
   DRAFT
   PUBLISHED
@@ -86,15 +97,35 @@ model Recording {
   status          RecordingStatus @default(UPLOADING)
   processingError String?
   version         Int             @default(1)
+  // 上传幂等键（工作区内唯一），客户端重试不会生成第二份录音
+  uploadKey       String?         @unique
   createdById     String
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
   workspace       Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   createdBy       User            @relation(fields: [createdById], references: [id], onDelete: Restrict)
   clips           Clip[]
+  mediaTask       MediaTask?
 
   @@index([workspaceId, updatedAt])
   @@index([createdById])
+}
+
+model MediaTask {
+  // 发件箱主键即 recordingId：一条录音永远只有一份处理记录
+  recordingId String          @id
+  status      MediaTaskStatus @default(PENDING)
+  attempts    Int             @default(0)
+  lastError   String?
+  lockedAt    DateTime?
+  lockedBy    String?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  recording   Recording       @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+
+  @@index([status, updatedAt])
 }
 
 model Person {
